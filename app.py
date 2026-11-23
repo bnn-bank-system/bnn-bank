@@ -27,6 +27,8 @@ from lanjutan import _siap as init_lanjutan
 from lanjutan import arus_kas, jurnal_penutup, perubahan_ekuitas, rasio
 from kredit import (akrual_bunga, bayar_angsuran, bentuk_ckpn, cairkan_kredit,
                     hitung_ckpn, hitung_jadwal)
+from layanan import (buka_rekening_baru, cari_nasabah, daftarkan_nasabah, ringkas_nasabah, ringkasan_cs,
+                     riwayat_layanan, ubah_nasabah, ubah_status_rekening)
 from laporan import laba_rugi, posisi_keuangan, ringkasan
 from persetujuan import _siap as init_persetujuan
 from persetujuan import (AMBANG_PERSETUJUAN, ajukan_jurnal_manual, ajukan_transaksi, daftar_pengajuan,
@@ -91,6 +93,9 @@ CSS_LOGIN = """<style>[data-testid="stSidebar"], [data-testid="stSidebarCollapse
 [data-testid="collapsedControl"] {display:none;}</style>"""
 
 
+PERAN_LABEL = {"cs": "Customer Service"}
+
+
 def splash(teks="Memuat"):
     kotak = st.empty()
     kotak.markdown(
@@ -125,6 +130,15 @@ def opsi_rekening(conn):
 # ---------- halaman ----------
 def halaman_dashboard(conn, user):
     st.subheader("Dashboard")
+    if user["peran"] == "cs":
+        r = ringkasan_cs(conn)
+        for kol, (judul, nilai) in zip(st.columns(4), [("Nasabah", r["nasabah"]), ("Rekening aktif", r["aktif"]),
+                                                       ("Rekening diblokir", r["diblokir"]),
+                                                       ("Nasabah baru (30 hari)", r["baru_30_hari"])]):
+            kol.metric(judul, nilai)
+        st.info("Gunakan menu Layanan nasabah untuk pendaftaran, perubahan data, dan status rekening. "
+                "Setoran awal dan transaksi uang dilayani teller.")
+        return
     if user["peran"] == "supervisor" and jumlah_menunggu(conn):
         st.warning(f"{jumlah_menunggu(conn)} pengajuan menunggu persetujuan Anda. Buka menu Persetujuan.")
     r = ringkasan(conn)
@@ -185,11 +199,11 @@ def halaman_nasabah(conn, user):
                 st.rerun()
     st.markdown("#### Daftar rekening")
     rows = conn.execute(
-        """SELECT r.no_rek, n.cif, n.nama, r.jenis, r.saldo
+        """SELECT r.no_rek, n.cif, n.nama, r.jenis, r.saldo, r.status
            FROM rekening r JOIN nasabah n ON n.cif = r.cif ORDER BY r.no_rek""").fetchall()
     if rows:
         tabel(pd.DataFrame([{"No. rekening": x["no_rek"], "CIF": x["cif"], "Nama": x["nama"],
-                             "Jenis": x["jenis"], "Saldo": rupiah(x["saldo"])} for x in rows]))
+                             "Jenis": x["jenis"], "Saldo": rupiah(x["saldo"]), "Status": x["status"]} for x in rows]))
     else:
         st.caption("Belum ada rekening.")
 
@@ -780,6 +794,118 @@ def halaman_lanjutan(conn, user):
                            mime="application/pdf")
 
 
+def halaman_layanan(conn, user):
+    st.subheader("Layanan nasabah")
+    t1, t2, t3, t4 = st.tabs(["Pendaftaran dan rekening baru", "Cari dan ubah data", "Status rekening",
+                              "Ringkasan nasabah"])
+    nas = conn.execute("SELECT cif, nama FROM nasabah ORDER BY cif").fetchall()
+    peta = {r["cif"]: f"{r['cif']} - {r['nama']}" for r in nas}
+
+    with t1:
+        kiri, kanan = st.columns(2)
+        with kiri:
+            st.markdown("**Daftarkan nasabah baru**")
+            with st.form("cs_daftar", clear_on_submit=True):
+                nama = st.text_input("Nama lengkap sesuai KTP")
+                nik = st.text_input("NIK (16 digit)")
+                alamat = st.text_input("Alamat")
+                kirim = st.form_submit_button("Simpan nasabah")
+            if kirim:
+                try:
+                    flash("ok", f"Nasabah terdaftar dengan nomor {daftarkan_nasabah(conn, nama, nik, alamat, user)}")
+                except ValueError as e:
+                    flash("err", str(e))
+                st.rerun()
+        with kanan:
+            st.markdown("**Buka rekening tabungan**")
+            if not peta:
+                st.info("Belum ada nasabah.")
+            else:
+                with st.form("cs_rekening", clear_on_submit=True):
+                    cif = st.selectbox("Nasabah", list(peta), format_func=peta.get)
+                    kirim = st.form_submit_button("Buka rekening")
+                st.caption("Rekening dibuka dengan saldo nol. Setoran awal dilakukan di teller.")
+                if kirim:
+                    try:
+                        flash("ok", f"Rekening {buka_rekening_baru(conn, cif, user)} berhasil dibuka")
+                    except ValueError as e:
+                        flash("err", str(e))
+                    st.rerun()
+
+    with t2:
+        q = st.text_input("Cari (nomor CIF, nama, NIK, atau nomor rekening)", key="cs_cari")
+        hasil = cari_nasabah(conn, q) if q.strip() else []
+        if q.strip() and not hasil:
+            st.info("Nasabah tidak ditemukan.")
+        elif hasil:
+            tabel(pd.DataFrame([{"CIF": r["cif"], "Nama": r["nama"], "NIK": r["nik"] or "", "Alamat": r["alamat"] or "",
+                                 "Jumlah rekening": r["jumlah_rekening"]} for r in hasil]))
+            pilih = st.selectbox("Pilih nasabah untuk diubah", [r["cif"] for r in hasil],
+                                 format_func=lambda c: next(f"{x['cif']} - {x['nama']}" for x in hasil if x["cif"] == c),
+                                 key="cs_pilih")
+            n = next(r for r in hasil if r["cif"] == pilih)
+            with st.form(f"cs_ubah_{pilih}"):
+                nama = st.text_input("Nama", value=n["nama"])
+                nik = st.text_input("NIK (16 digit)", value=n["nik"] or "")
+                alamat = st.text_input("Alamat", value=n["alamat"] or "")
+                kirim = st.form_submit_button("Simpan perubahan")
+            if kirim:
+                try:
+                    ubah_nasabah(conn, pilih, nama, nik, alamat, user)
+                    flash("ok", f"Data {pilih} diperbarui")
+                except ValueError as e:
+                    flash("err", str(e))
+                st.rerun()
+
+    with t3:
+        rek = conn.execute("""SELECT r.no_rek, n.nama, r.saldo, r.status FROM rekening r
+                              JOIN nasabah n ON n.cif = r.cif ORDER BY r.no_rek""").fetchall()
+        if not rek:
+            st.info("Belum ada rekening.")
+        else:
+            pr = {r["no_rek"]: f"{r['no_rek']} - {r['nama']} | {r['status']} | saldo {rupiah(r['saldo'])}" for r in rek}
+            no = st.selectbox("Rekening", list(pr), format_func=pr.get, key="cs_status_rek")
+            saat_ini = next(r["status"] for r in rek if r["no_rek"] == no)
+            if saat_ini == "tutup":
+                st.info("Rekening ini sudah ditutup dan tidak dapat diubah lagi.")
+            else:
+                baru = st.selectbox("Status baru", [x for x in ("aktif", "diblokir", "tutup") if x != saat_ini],
+                                    key=f"cs_baru_{no}")
+                alasan = st.text_input("Alasan (wajib)", key=f"cs_alasan_{no}")
+                st.caption("Rekening diblokir tidak bisa bertransaksi, termasuk debet angsuran. Penutupan hanya bila "
+                           "saldo nol dan tidak ada kredit atau deposito aktif, serta tidak dapat dibatalkan.")
+                if st.button("Ubah status rekening"):
+                    try:
+                        ubah_status_rekening(conn, no, baru, alasan, user)
+                        flash("ok", f"Status rekening {no} menjadi {baru}")
+                    except ValueError as e:
+                        flash("err", str(e))
+                    st.rerun()
+
+    with t4:
+        if not peta:
+            st.info("Belum ada nasabah.")
+        else:
+            cif = st.selectbox("Nasabah", list(peta), format_func=peta.get, key="cs_ringkas")
+            r = ringkas_nasabah(conn, cif)
+            st.markdown("**Rekening**")
+            tabel(pd.DataFrame([{"No. rekening": x["no_rek"], "Jenis": x["jenis"], "Saldo": rupiah(x["saldo"]),
+                                 "Status": x["status"]} for x in r["rekening"]]))
+            if r["kredit"]:
+                st.markdown("**Kredit**")
+                tabel(pd.DataFrame([{"No. kredit": x["no_kredit"], "Plafon": rupiah(x["plafon"]),
+                                     "Sisa pokok": rupiah(x["sisa"]), "Status": x["status"]} for x in r["kredit"]]))
+            if r["deposito"]:
+                st.markdown("**Deposito**")
+                tabel(pd.DataFrame([{"No. bilyet": x["no_bilyet"], "Nominal": rupiah(x["nominal"]),
+                                     "Jatuh tempo": x["jatuh_tempo"], "Status": x["status"]} for x in r["deposito"]]))
+    riwayat = riwayat_layanan(conn)
+    if riwayat:
+        st.markdown("#### Riwayat layanan terakhir")
+        tabel(pd.DataFrame([{"Waktu": x["waktu"], "Petugas": x["username"], "Tindakan": x["aksi"],
+                             "Keterangan": x["keterangan"]} for x in riwayat]))
+
+
 def halaman_akun_saya(conn, user):
     st.subheader("Akun saya")
     st.write(f"Masuk sebagai **{user['username']}** (peran: {user['peran']})")
@@ -823,6 +949,7 @@ def halaman_pengguna(conn, user):
 DAFTAR = [
     ("dashboard", "Operasional", "Dashboard", ":material/dashboard:", halaman_dashboard),
     ("nasabah", "Operasional", "Nasabah dan rekening", ":material/group:", halaman_nasabah),
+    ("layanan", "Operasional", "Layanan nasabah", ":material/support_agent:", halaman_layanan),
     ("transaksi", "Operasional", "Transaksi teller", ":material/swap_horiz:", halaman_transaksi),
     ("persetujuan", "Operasional", "Persetujuan", ":material/fact_check:", halaman_persetujuan),
     ("jurnal_manual", "Pembukuan", "Jurnal manual", ":material/edit_note:", halaman_jurnal_manual),
@@ -841,6 +968,7 @@ HALAMAN = {k: f for k, _, _, _, f in DAFTAR}
 
 AKSES = {
     "teller": {"dashboard", "nasabah", "transaksi", "persetujuan", "akun"},
+    "cs": {"dashboard", "layanan", "akun"},
     "akuntan": {"dashboard", "persetujuan", "jurnal_manual", "jurnal_umum", "buku_besar", "akhir_bulan", "kredit", "deposito", "neraca", "laporan", "lanjutan", "akun"},
     "supervisor": {k for k, *_ in DAFTAR},
 }
@@ -883,7 +1011,7 @@ def halaman_login():
                 finally:
                     conn.close()
         with st.expander("Akun demo"):
-            st.write("Username: supervisor, akuntan, atau teller. Password awal: Bnn@2026. "
+            st.write("Username: supervisor, akuntan, teller, atau cs. Password awal: Bnn@2026. "
                      "Ganti lewat menu Akun saya setelah masuk.")
 
 
@@ -932,7 +1060,7 @@ def main():
             st.rerun()
 
     st.markdown(f'<div class="bnn-top"><div><b>BNN</b><span>Bank Neneng Nopitasari</span></div>'
-                f'<div style="font-size:13px">Petugas: {user["username"]} | Peran: {user["peran"].title()}</div></div>',
+                f'<div style="font-size:13px">Petugas: {user["username"]} | Peran: {PERAN_LABEL.get(user["peran"], user["peran"].title())}</div></div>',
                 unsafe_allow_html=True)
     tampil_flash()
     pg.run()
